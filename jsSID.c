@@ -4,13 +4,19 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <math.h>
+#include <string.h>
+#include "jsSID.h"
 
+typedef unsigned short u16;
 typedef unsigned char byte;
 typedef unsigned int u32;
 typedef signed int s32;
 
+#define READ_LIL16(p) *((u16*)p)
+#define nothing() ({ asm(" "); })
+
 enum { C64_PAL_CPUCLK = 985248,	SID_CHANNEL_AMOUNT = 3, 
-	OUTPUT_SCALEDOWN = 0x10000 * SID_CHANNEL_AMOUNT * 16};
+	OUTPUT_SCALEDOWN = 0x1000000 * SID_CHANNEL_AMOUNT * 16};
 
 enum { GATE_BITMASK=0x01, SYNC_BITMASK=0x02, RING_BITMASK=0x04,
 	TEST_BITMASK=0x08, TRI_BITMASK=0x10, SAW_BITMASK=0x20,
@@ -18,28 +24,18 @@ enum { GATE_BITMASK=0x01, SYNC_BITMASK=0x02, RING_BITMASK=0x04,
 	DECAYSUSTAIN_BITMASK=0x40, ATTACK_BITMASK=0x80, LOWPASS_BITMASK=0x10,
 	BANDPASS_BITMASK=0x20, HIGHPASS_BITMASK=0x40, OFF3_BITMASK=0x80 };
 
-
-//'static' variables and fuctions will only be seen by the current file (or compilation unit) unlike simple global variables or 'extern' ones
-static const byte FILTSW[9] = {1,2,4,1,2,4,1,2,4};
-
-static char buildWaveforms=1;
-static byte sidRegs[3][25], ADSRstate[9], envcnt[9], expcnt[9], sourceMSBrise[9];  
-static unsigned int ratecnt[9], prevwfout[9]; 
-static u32 phaseaccu[9], prevaccu[9], sourceMSB[3], noise_LFSR[9];
-static float prevlowpass[3], prevbandpass[3], cutoff_ratio_8580, cutoff_ratio_6581, cutoff_bias_6581;
-static int SID_model, muteMask_c64=0;
 static unsigned int TriSaw_8580[4096], PulseSaw_8580[4096], PulseTriSaw_8580[4096];
-static int ADSRperiods[16] = {9, 32, 63, 95, 149, 220, 267, 313, 392, 977, 1954, 3126, 3907, 11720, 19532, 31251};
+static const int ADSRperiods[16] = {9, 32, 63, 95, 149, 220, 267, 313, 392, 977, 1954, 3126, 3907, 11720, 19532, 31251};
 static const byte ADSR_exptable[256] = {1, 30, 30, 30, 30, 30, 30, 16, 16, 16, 16, 16, 16, 16, 16, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 4, 4, 4, 4, 4, //pos0:1  pos6:30  pos14:16  pos26:8
 	4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 1, 1, //pos54:4 //pos93:2
 	1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
 	1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
 	1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1 };
 
-
-static unsigned int combinedWF(int channel, unsigned int* wfarray, int index, char differ6581)
+static unsigned int combinedWF(SidChip* This, 
+	unsigned int* wfarray, int index, char differ6581)
 {
-	if(differ6581 && SID_model==6581) index&=0x7FF; 
+	if(differ6581 && This->model_6581) index&=0x7FF; 
 	return wfarray[index];
 }
 
@@ -53,180 +49,211 @@ static void createCombinedWF(unsigned int* wfarray, float bitmul, float bitstren
 		wfarray[i] += (bitlevel>=treshold)? pow(2,j) : 0; } wfarray[i]*=12;  }
 }
 
-
-float jsSID_getVolume(int channel)
+void jsSID_calCuto(SidChip* This)
 {
-	if(sidRegs[0][0x18]&0xF==0)return 0.0f;
-	return envcnt[channel]/256.0f;
+	float tmp = (This->regs[0] & 7) / 8.0 + This->regs[1] + 0.2;
+	if (!This->model_6581) {
+		This->cutoff = 1 - exp(tmp * This->cutoff_ratio);
+	} else {
+		This->cutoff = This->cutoff_bias + ( (tmp < 24)
+			? 0 : 1 - exp((tmp-24) * This->cutoff_ratio ));
+	}
 }
 
-void jsSID_setMuteMask(int mute_mask)
+void jsSID_calcReso(SidChip* This)
 {
-	muteMask_c64=mute_mask;
+	int value = This->regs[2] >> 4;
+	if(!This->model_6581) {
+		This->resonance = pow(2, ((4 - value) / 8.0));
+	} else {
+		This->resonance = (value > 5) ? 8.0 / (value) : 1.41;
+	}
 }
 
-void jsSID_init(int samplerate, int model)
+void jsSID_init(SidChip* This,
+	int samplerate, int model)
 {
-	int i;
-	SID_model = model==1?6581:8580;
-	cutoff_ratio_8580 = -2 * 3.14 * (12500.0 / 256) / samplerate;
-	cutoff_ratio_6581 = -2 * 3.14 * (20000.0 / 256) / samplerate;
-	cutoff_bias_6581 = 1 - exp( -2 * 3.14 * 220 / samplerate ); //around 220Hz below treshold
+	memset(This, 0, sizeof(*This));
+	for(int i = 0; i < 3; i++) {
+		This->chnl[i].noise_LFSR = 0x7FFFF8;
+ 		This->chnl[i].muteMask = 1; }
+	This->rand_state = 0;
+
+	// filter state
+	This->model_6581 = model;
+	float cutoff_const = !This->model_6581 ? 
+		(-2 * 3.14 * (12500.0 / 256)) : -2 * 3.14 * (20000.0 / 256);
+	This->cutoff_ratio = cutoff_const / samplerate;
+	This->cutoff_bias = 1 - exp( -2 * 3.14 * 220 / samplerate ); //around 220Hz below treshold
+	jsSID_calCuto(This); jsSID_calcReso(This);
 	
-	if(buildWaveforms){
+	// combined waveforms
+	static char builtWaveforms=0;
+	if(!builtWaveforms){
 		createCombinedWF(TriSaw_8580, 0.8, 2.4, 0.64);
 		createCombinedWF(PulseSaw_8580, 1.4, 1.9, 0.68);
 		createCombinedWF(PulseTriSaw_8580, 0.8, 2.5, 0.64);
-		buildWaveforms=0;   //This is used to build the waveform only once to speed up a future re-initialization
+		builtWaveforms=1;   //This is used to build the waveform only once to speed up a future re-initialization
 	}
-	
-	for(i = 0; i < 9; i++) {
-		ADSRstate[i] = HOLDZERO_BITMASK; envcnt[i] = 0; ratecnt[i] = 0; 
-		phaseaccu[i] = 0; prevaccu[i] = 0; expcnt[i] = 0; 
-		noise_LFSR[i] = 0x7FFFF8; prevwfout[i] = 0;
-	}
-	for(i = 0; i < 3; i++) {
-		sourceMSBrise[i] = 0; sourceMSB[i] = 0;
-		prevlowpass[i] = 0; prevbandpass[i] = 0;
-	}
-	for(i=0; i < 25; i++) { sidRegs[0][i]=0; sidRegs[1][i]=0; sidRegs[2][i]=0; }
-
 }
 
-void jsSID_write(int chip, int addr, int data)
+void jsSID_write(SidChip* This,
+	int addr, int data)
 {
-	sidRegs[chip][addr] = data;
+	SidChnl* chnl = This->chnl;
+	if(addr < 0x15) 
+	{	
+		// update channel register
+		while(addr >= 7) { addr -= 7; chnl++; }
+		byte diff = chnl->regs[addr] ^ data;
+		chnl->regs[addr] = data; 
+		
+		// update ADSR state
+		if((addr == 4)&&(diff & GATE_BITMASK)){ 
+			if (data & GATE_BITMASK) { chnl->ADSRstate = (ATTACK_BITMASK 
+				| DECAYSUSTAIN_BITMASK); goto ADSR_ATTACK; }
+			else { chnl->ADSRstate &= ~(ATTACK_BITMASK
+				| DECAYSUSTAIN_BITMASK); goto ADSR_RELEASE; }
+		}
+				
+		// update ADSR period	
+		else if(addr > 4) {
+			if (chnl->ADSRstate & ATTACK_BITMASK) { ADSR_ATTACK: 
+				chnl->period = ADSRperiods[ chnl->regs[5] >> 4 ]; }
+			else if (chnl->ADSRstate & DECAYSUSTAIN_BITMASK) { 
+				chnl->period = ADSRperiods[ chnl->regs[5] & 0xF ]; }
+			else { ADSR_RELEASE: chnl->period =	ADSRperiods[ chnl->regs[6] & 0xF ]; }
+		}
+		
+	} else {
+		// filters and resonance
+		byte diff = This->regs[addr-0x15] ^ data;
+		if(diff) { This->regs[addr-0x15] = data;
+		if(addr < 0x17) { jsSID_calCuto(This); nothing(); 
+		} else if(addr == 0x17) { 
+			if(diff>>4) jsSID_calcReso(This);
+			data = ~data & 7; for(int i = 0; i < 3; i++) { 
+				chnl[i].muteMask ^= data; data >>= 1; }
+		} else { chnl[2].muteMask ^= diff & 0x80; }}
+	}
+}
+ 
+void jsSID_setMuteMask(SidChip* This, int mute_mask) {
+	for(int i = 0; i < 3; i++) { This->chnl[i].muteMask &= 0xEF;
+		if(mute_mask & (1<<i)) This->chnl[i].muteMask |= 0x10; }
 }
 
-
-float jsSID_render(int num)
+static inline
+u32 jsSID_triangle(SidChip* This, byte ctrl, u32 phaseaccu)
 {
-	byte channel, ctrl, SR, prevgate, wf, test; 
-	byte *sReg, *vReg;
+	int tmp = phaseaccu ^ (ctrl & RING_BITMASK ? This->sourceMSB : 0);
+	return (((tmp < 0) ? ~phaseaccu : phaseaccu) >> 15) & 0xFFFF;
+}
+
+static inline
+u32 jsSID_pulse(SidChnl* chnl, 
+	byte test, u32 phaseaccu)
+{
+	u32 pw = READ_LIL16(&chnl->regs[2]) & 0xFFF;
+	u32 tmp = phaseaccu >> 20;
+	return ((tmp>=pw) || test) ? 0xFFFF : 0x0000;
+}
+
+float jsSID_render(SidChip* This)
+{
+	int channel;
 	unsigned int period, accuadd, pw, wfout;
 	u32 MSB;
-	float filtin, output, ftmp, resonance, cutoff; 
+	float filtin, output, ftmp; 
 
-	filtin=output=0; sReg = sidRegs[num]; vReg = sReg;
-	for (channel = num * SID_CHANNEL_AMOUNT; channel < (num + 1) * SID_CHANNEL_AMOUNT; channel++, vReg += 7) {
-		ctrl = vReg[4];
-
+	filtin=output=0; 
+	for (channel = 0; channel < SID_CHANNEL_AMOUNT; channel++) {
+		SidChnl* chnl = &This->chnl[channel];
+		
+		// gcc register alloctor is braindead
+		// we need to hold its hand
+		#if __GNUC__ && __i386__
+			asm("" : : "S"(chnl), "D"(This));
+		#endif
+	
 		//ADSR envelope generator:
-		{
-			SR = vReg[6];
-			prevgate = (ADSRstate[channel] & GATE_BITMASK);
-			if (prevgate != (ctrl & GATE_BITMASK)) { //gatebit-change?
-				if (prevgate) {
-					ADSRstate[channel] &= 0xFF - (GATE_BITMASK | ATTACK_BITMASK | DECAYSUSTAIN_BITMASK);
-				} //falling edge
-				else {
-					ADSRstate[channel] = (GATE_BITMASK | ATTACK_BITMASK | DECAYSUSTAIN_BITMASK); //rising edge, also sets hold_zero_bit=0
-				}
-			}
-			if (ADSRstate[channel] & ATTACK_BITMASK) period = ADSRperiods[ vReg[5] >> 4 ];
-		else if (ADSRstate[channel] & DECAYSUSTAIN_BITMASK) period = ADSRperiods[ vReg[5] & 0xF ];
-		else period = ADSRperiods[ SR & 0xF ];
-			ratecnt[channel]++; ratecnt[channel]&=0x7FFF;   //can wrap around (ADSR delay-bug: short 1st frame)
-			if (ratecnt[channel] == period) { //ratecounter shot (matches rateperiod) (in genuine SID ratecounter is LFSR)
-				ratecnt[channel] = 0; //reset rate-counter on period-match
-				if ((ADSRstate[channel] & ATTACK_BITMASK) || ++expcnt[channel] == ADSR_exptable[envcnt[channel]]) {
-					expcnt[channel] = 0; 
-					if (!(ADSRstate[channel] & HOLDZERO_BITMASK)) {
-						if (ADSRstate[channel] & ATTACK_BITMASK) {
-							if (envcnt[channel]!=0xFF) envcnt[channel]++; 
-							else ADSRstate[channel] &= 0xFF - ATTACK_BITMASK;
-						} else if ( !(ADSRstate[channel] & DECAYSUSTAIN_BITMASK) || envcnt[channel] != (SR >> 4) + (SR & 0xF0) ) {
-							if (envcnt[channel]!=0) envcnt[channel]--;
-							else ADSRstate[channel] |= HOLDZERO_BITMASK;
-						}
+		#define SR chnl->regs[6]
+		chnl->ratecnt++; chnl->ratecnt&=0x7FFF;   //can wrap around (ADSR delay-bug: short 1st frame)
+		if (chnl->ratecnt == chnl->period) { //ratecounter shot (matches rateperiod) (in genuine SID ratecounter is LFSR)
+			chnl->ratecnt = 0; //reset rate-counter on period-match
+			if ((chnl->ADSRstate & ATTACK_BITMASK) || ++chnl->expcnt == ADSR_exptable[chnl->envcnt]) {
+				chnl->expcnt = 0; 
+				if (!(chnl->ADSRstate & HOLDZERO_BITMASK)) {
+					if (chnl->ADSRstate & ATTACK_BITMASK) {
+						if (chnl->envcnt!=0xFF) chnl->envcnt++; 
+						else { chnl->ADSRstate &= 0xFF - ATTACK_BITMASK;
+							chnl->period = ADSRperiods[ chnl->regs[5] & 0xF ]; }
+					} else if ( !(chnl->ADSRstate & DECAYSUSTAIN_BITMASK) || chnl->envcnt != (SR >> 4) + (SR & 0xF0) ) {
+						if (chnl->envcnt!=0) chnl->envcnt--;
+						else chnl->ADSRstate |= HOLDZERO_BITMASK;
 					}
 				}
 			}
-			envcnt[channel] &= 0xFF;
 		}
 		
 		//WAVE generation codes (phase accumulator and waveform-selector):
-		test = ctrl & TEST_BITMASK;
-		wf = ctrl & 0xF0;
-		accuadd = (vReg[0] + vReg[1] * 256);
-		if (test || ((ctrl & SYNC_BITMASK) && sourceMSBrise[num])) {
-			phaseaccu[channel] = 0;
+		#define ctrl chnl->regs[4]
+		#define test (chnl->regs[4] & TEST_BITMASK)
+		#define wf (chnl->regs[4] & 0xF0)
+		
+		u32 prevaccu = chnl->phaseaccu; u32 phaseaccu;
+		accuadd = READ_LIL16(&chnl->regs[0]) << 8;
+		if (test || (This->sourceMSBrise && (ctrl & SYNC_BITMASK))) {
+			phaseaccu = 0;
 		} else {
-			phaseaccu[channel] += accuadd; phaseaccu[channel]&=0xFFFFFF;
+			phaseaccu = prevaccu + accuadd; 
 		}
-		MSB = phaseaccu[channel] & 0x800000;
-		sourceMSBrise[num] = (MSB > (prevaccu[channel] & 0x800000)) ? 1 : 0;
+		chnl->phaseaccu = phaseaccu;
+		This->sourceMSBrise = (~prevaccu & phaseaccu) >> 31;
+
 		if (wf & NOISE_BITMASK) {
-			int tmp = noise_LFSR[channel];
-			if (((phaseaccu[channel] & 0x100000) != (prevaccu[channel] & 0x100000))) { 
-				int step = (tmp & 0x400000) ^ ((tmp & 0x20000) << 5);
-				tmp = ((tmp << 1) + (step ? 1 : test)) & 0x7FFFFF;
-				noise_LFSR[channel] = tmp;
+			int tmp = chnl->noise_LFSR;
+			if (((phaseaccu & 0x10000000) != (prevaccu & 0x10000000))) { 
+				int step = ((tmp >> 22)	^ (tmp >> 17)) & 0x1;
+				tmp = (tmp << 1) | step; chnl->noise_LFSR = tmp; 
 			}
 			wfout = (wf & 0x70) ? 0 : ((tmp & 0x100000) >> 5) + ((tmp & 0x40000) >> 4) + ((tmp & 0x4000) >> 1) + ((tmp & 0x800) << 1) + ((tmp & 0x200) << 2) + ((tmp & 0x20) << 5) + ((tmp & 0x04) << 7) + ((tmp & 0x01) << 8);
 		} else if (wf & PULSE_BITMASK) {
-			pw = (vReg[2] + (vReg[3] & 0xF) * 256) * 16;
-			
-			int tmp = phaseaccu[channel] >> 8;
-			if (wf == PULSE_BITMASK) {
-				if (test || tmp>=pw) wfout = 0xFFFF;
-				else {
-					wfout=0;
+			wfout = jsSID_pulse(chnl, test, phaseaccu);
+			if(wfout && (wf & ~PULSE_BITMASK)) { //combined pulse
+				if (wf & TRI_BITMASK) { if (wf & SAW_BITMASK) {
+					wfout = combinedWF(This, PulseTriSaw_8580, phaseaccu >> 20, 1);
+				} else { wfout = combinedWF(This, PulseSaw_8580,
+					jsSID_triangle(This, ctrl, phaseaccu) >> 4, 0);
+				}} else { wfout = combinedWF(This, PulseSaw_8580, phaseaccu >> 20, 1);
 				}
-			}
-			else { //combined pulse
-				wfout = (tmp >= pw || test) ? 0xFFFF : 0; //(this would be enough for simple but aliased-at-high-pitches pulse)
-				if (wf & TRI_BITMASK) {
-					if (wf & SAW_BITMASK) {
-						wfout = (wfout) ? combinedWF(channel, PulseTriSaw_8580, tmp >> 4, 1) : 0;
-					} //pulse+saw+triangle (waveform nearly identical to tri+saw)
-					else {
-						tmp = phaseaccu[channel] ^ (ctrl & RING_BITMASK ? sourceMSB[num] : 0);
-						wfout = (wfout) ? combinedWF(channel, PulseSaw_8580, (tmp ^ (tmp & 0x800000 ? 0xFFFFFF : 0)) >> 11, 0) : 0;
-					}
-				} //pulse+triangle
-				else if (wf & SAW_BITMASK) wfout = (wfout) ? combinedWF(channel, PulseSaw_8580, tmp >> 4, 1) : 0;
 			}
 		} //pulse+saw
 		else if (wf & SAW_BITMASK) { 
-			wfout = phaseaccu[channel] >> 8; //saw
-			if (wf & TRI_BITMASK) wfout = combinedWF(channel, TriSaw_8580, wfout >> 4, 1); //saw+triangle
+			wfout = phaseaccu >> 16; //saw
+			if (wf & TRI_BITMASK) wfout = combinedWF(This, TriSaw_8580, wfout >> 4, 1); //saw+triangle
 		}
 		else if (wf & TRI_BITMASK) {
-			int tmp = phaseaccu[channel] ^ (ctrl & RING_BITMASK ? sourceMSB[num] : 0);
-			wfout = (tmp ^ (tmp & 0x800000 ? 0xFFFFFF : 0)) >> 7;
-		}
-		if (wf) prevwfout[channel] = wfout;
-		else {
-			wfout = prevwfout[channel];
-		} //emulate waveform 00 floating wave-DAC
-		prevaccu[channel] = phaseaccu[channel];
-		sourceMSB[num] = MSB; 
-		if (!(muteMask_c64 & FILTSW[channel])) {
-			if (sReg[0x17] & FILTSW[channel]) filtin += ((s32)wfout - 0x8000) * (envcnt[channel] / 256.0);
-			else if ((FILTSW[channel] != 4) || !(sReg[0x18] & OFF3_BITMASK)) 
-				output += ((s32)wfout - 0x8000) * (envcnt[channel]) / 256.0;
-		}
+			wfout = jsSID_triangle(This, ctrl, phaseaccu);
+		} else {
+			wfout = chnl->prevwfout;		
+		} chnl->prevwfout = wfout; //emulate waveform 00 floating wave-DAC
+		
+		This->sourceMSB = phaseaccu; 
+		ftmp = ((s32)wfout - 0x8000) * chnl->envcnt;
+		if(!(chnl->muteMask & 0x11)) filtin += ftmp;
+		else if(!(chnl->muteMask & 0x90)) output += ftmp;
 	}
 	
 	//FILTER:
-	cutoff = (sReg[0x15] & 7) / 8.0 + sReg[0x16] + 0.2;
-	if (SID_model == 8580) {
-		cutoff = 1 - exp(cutoff * cutoff_ratio_8580);
-		resonance = pow(2, ((4 - (sReg[0x17] >> 4)) / 8.0));
-	} else {
-		cutoff = cutoff_bias_6581 + ( (cutoff < 24) ? 0 : 1 - exp((cutoff-24) * cutoff_ratio_6581) );
-		resonance = (sReg[0x17] > 0x5F) ? 8.0 / (sReg[0x17] >> 4) : 1.41;
-	}
-	ftmp = filtin + prevbandpass[num] * resonance + prevlowpass[num];
-	if (sReg[0x18] & HIGHPASS_BITMASK) output -= ftmp;
-	ftmp = prevbandpass[num] - ftmp * cutoff;
-	prevbandpass[num] = ftmp;
-	if (sReg[0x18] & BANDPASS_BITMASK) output -= ftmp;
-	ftmp = prevlowpass[num] + ftmp * cutoff;
-	prevlowpass[num] = ftmp;
-	if (sReg[0x18] & LOWPASS_BITMASK) output += ftmp; 
-	output = (output / OUTPUT_SCALEDOWN) * (sReg[0x18] & 0xF);
-	if (output>=1.0) output=1.0; else if (output<=-1.0) output=-1.0; //saturation logic on overload (not needed if the callback handles it)
-	return output; // master output
+	filtin += *(float*)&This->rand_state; This->rand_state ^= 0x37800000;
+	ftmp = filtin + This->prevbandpass * This->resonance + This->prevlowpass;
+	if (This->regs[3] & HIGHPASS_BITMASK) output -= ftmp;
+	ftmp = This->prevbandpass - ftmp * This->cutoff;
+	This->prevbandpass = ftmp;
+	if (This->regs[3] & BANDPASS_BITMASK) output -= ftmp;
+	ftmp = This->prevlowpass + ftmp * This->cutoff;
+	This->prevlowpass = ftmp;
+	if (This->regs[3] & LOWPASS_BITMASK) output += ftmp; 
+	return output * (This->regs[3] & 0xF);
 }

@@ -24,11 +24,20 @@
 extern "C" {
 #endif
 
-void jsSID_init(int sampleRate, int model);
-void jsSID_write(int chip, int addr, int data);
-float jsSID_getVolume(int channel);
-void jsSID_setMuteMask(int mute_mask);
-double jsSID_render(int chip);
+typedef struct { unsigned char regs[7]; unsigned char ADSRstate, envcnt,
+	expcnt, muteMask, noiseCache; unsigned ratecnt, prevwfout, 
+	phaseaccu, noise_LFSR; unsigned short period; } SidChnl;
+typedef struct { unsigned char regs[4], model_6581, sourceMSBrise;
+	unsigned sourceMSB, rand_state; float prevlowpass, prevbandpass, cutoff,
+	resonance, cutoff_ratio, cutoff_bias; SidChnl chnl[3]; } SidChip;
+
+void jsSID_init(SidChip* This, int samplerate, int model);
+void jsSID_write(SidChip* This, int addr, int data);
+float jsSID_render(SidChip* This);
+void jsSID_setMuteMask(SidChip* This, int mute_mask);
+
+#define JSSID_SCALEDOWN (1.0F/0x30000000)
+#define JSSID_SCALE(o,s) (o*s*JSSID_SCALEDOWN)
 
 #ifdef __cplusplus
 }
