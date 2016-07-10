@@ -132,8 +132,8 @@ void jsSID_write(SidChip* This,
 		if(addr < 0x17) { jsSID_calCuto(This); nothing(); 
 		} else if(addr == 0x17) { 
 			if(diff>>4) jsSID_calcReso(This);
-			data = ~data & 7; for(int i = 0; i < 3; i++) { 
-				chnl[i].muteMask ^= data; data >>= 1; }
+			diff = diff & 7; for(int i = 0; i < 3; i++) { 
+ 				chnl[i].muteMask ^= diff; diff >>= 1; }
 		} else { chnl[2].muteMask ^= diff & 0x80; }}
 	}
 }
